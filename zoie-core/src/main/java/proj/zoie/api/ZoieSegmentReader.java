@@ -43,8 +43,15 @@ import proj.zoie.api.indexing.IndexReaderDecorator;
 import proj.zoie.impl.indexing.internal.ZoieSegmentTermDocs;
 import proj.zoie.impl.indexing.internal.ZoieSegmentTermPositions;
 
+import com.yammer.metrics.Metrics;
+import com.yammer.metrics.core.Counter;
+
 public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>{
-	public static final String termVal="_UID";
+  private static final Counter numDeletedDocs = Metrics.newCounter(ZoieSegmentReader.class, "numDeletedDocs");
+  private static final Counter deletedDocIdsKeptInMemory = Metrics.newCounter(ZoieSegmentReader.class, "deletedDocIdsKeptInMemory");
+  
+  
+  public static final String termVal="_UID";
 	public static final Term UID_TERM = new Term(AbstractZoieIndexable.DOCUMENT_ID_PAYLOAD_FIELD,termVal);
     private R _decoratedReader;
     private long[] _uidArray;
@@ -149,7 +156,7 @@ public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>
       DocIDMapper<?> idMapper = getDocIDMaper();
       LongIterator iter = delDocs.iterator();
       IntRBTreeSet delDocIdSet = _delDocIdSet;
-
+      int countOfDeletedDocs = 0;
       while(iter.hasNext())
       {
         long uid = iter.nextLong();
@@ -160,17 +167,27 @@ public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>
           {
             delDocIdSet.add(docid);
             deletedUIDs.add(uid);
+            countOfDeletedDocs++;
           }
         }
       }	  
+      // we need to update counters only for big segments
+      if (_uidArray.length > 10000) {
+        numDeletedDocs.inc(countOfDeletedDocs);
+      }
 	}
 	
 	@Override
 	public void commitDeletes()
 	{
 	  _currentDelDocIds = _delDocIdSet.toIntArray();
+	  if (_currentDelDocIds.length > deletedDocIdsKeptInMemory.count()) {
+	    deletedDocIdsKeptInMemory.clear();
+	    deletedDocIdsKeptInMemory.inc(_currentDelDocIds.length);	   
+	  }
+	  
 	}
-	
+
 	public void setDelDocIds()
 	{
 	  _delDocIds = _currentDelDocIds;
