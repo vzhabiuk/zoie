@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.apache.log4j.Logger;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.analysis.tokenattributes.PayloadAttribute;
@@ -47,6 +48,7 @@ import com.yammer.metrics.Metrics;
 import com.yammer.metrics.core.Counter;
 
 public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>{
+  private static Logger logger = Logger.getLogger(ZoieSegmentReader.class);
   private static final Counter numDeletedDocs = Metrics.newCounter(ZoieSegmentReader.class, "numDeletedDocs");
   private static final Counter deletedDocIdsKeptInMemory = Metrics.newCounter(ZoieSegmentReader.class, "deletedDocIdsKeptInMemory");
   
@@ -165,7 +167,10 @@ public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>
           int docid = idMapper.getDocID(uid);
           if(docid != DocIDMapper.NOT_FOUND)
           {
-            delDocIdSet.add(docid);
+            //we don't want to add deleted docs that are already there
+            if (_currentDelDocIds == null || Arrays.binarySearch(_currentDelDocIds, docid) < 0) {
+              delDocIdSet.add(docid);
+            }
             deletedUIDs.add(uid);
             countOfDeletedDocs++;
           }
@@ -180,13 +185,65 @@ public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>
 	@Override
 	public void commitDeletes()
 	{
-	  _currentDelDocIds = _delDocIdSet.toIntArray();
+	  if (_delDocIdSet.size() == 0) {
+	    return;
+	  }
+	  _currentDelDocIds = mergeWithCurrentDeletedDocs(_currentDelDocIds, _delDocIdSet);
+	  
+	      
+	  _delDocIdSet.clear();
 	  if (_currentDelDocIds.length > deletedDocIdsKeptInMemory.count()) {
 	    deletedDocIdsKeptInMemory.clear();
 	    deletedDocIdsKeptInMemory.inc(_currentDelDocIds.length);	   
 	  }
 	  
 	}
+
+  /**This complicated logic is needed only for updateable hourglass, wehere we might keep large number of deleted events
+   * @param currentDelDocIds
+   * @param delDocIdSet
+   * @return
+   */
+  public int[] mergeWithCurrentDeletedDocs(int[] currentDelDocIds, IntRBTreeSet delDocIdSet) {
+    if (currentDelDocIds == null) {
+      currentDelDocIds = new int[0];
+    }
+    int[] newDeletedDocs = delDocIdSet.toIntArray();
+	  int[] newCurrentDelDocIds = new int[newDeletedDocs.length + currentDelDocIds.length];
+	  int count1 = 0;
+	  int count2 = 0;
+	  int newIndex = 0;
+	  while(count1 < newDeletedDocs.length || count2 < currentDelDocIds.length) {
+	    if (count1 < newDeletedDocs.length && count2 < currentDelDocIds.length) {
+	      if (newDeletedDocs[count1] > currentDelDocIds[count2]) {
+	        newCurrentDelDocIds[newIndex] = currentDelDocIds[count2];
+	        count2++;
+	      } else if (newDeletedDocs[count1] < currentDelDocIds[count2]) {
+	        newCurrentDelDocIds[newIndex] = newDeletedDocs[count1];
+	        count1++;
+	      } else {
+	        newCurrentDelDocIds[newIndex] = newDeletedDocs[count1];
+	        count1++;
+	        count2++;
+	      }	      
+	    } else if (count1 < newDeletedDocs.length) {
+	      newCurrentDelDocIds[newIndex] = newDeletedDocs[count1];
+        count1++;
+	    } else if (count2 < currentDelDocIds.length) {
+	      newCurrentDelDocIds[newIndex] = currentDelDocIds[count2];
+	      count2++;
+	    }
+	    newIndex++;
+	  }
+	  if (newCurrentDelDocIds.length != newIndex) {
+	    logger.error("There were duplicates between delDocIdSet and currentDelDocIds. This should not happen");
+	    int[] tmp = new int[newIndex];
+	    System.arraycopy(newCurrentDelDocIds, 0, tmp, 0, newIndex);
+	    newCurrentDelDocIds = tmp;
+	  }
+	  currentDelDocIds = newCurrentDelDocIds;
+	  return currentDelDocIds;
+  }
 
 	public void setDelDocIds()
 	{
@@ -360,7 +417,20 @@ public class ZoieSegmentReader<R extends IndexReader> extends ZoieIndexReader<R>
    @Override
   public int numDocs() {
      if (_currentDelDocIds != null) {
-       return super.maxDoc() - _currentDelDocIds.length;
+       if (super.numDocs() == super.maxDoc()) {
+         return super.numDocs() - _currentDelDocIds.length;
+       } else {
+         int delta = 0;
+         for (int docId : _currentDelDocIds) {
+           if (!in.isDeleted(docId)) {
+             delta++;
+           }
+         }
+         return super.numDocs() - delta;
+       }
+       
+       
+       
      }  else {
        return super.numDocs();
      }
